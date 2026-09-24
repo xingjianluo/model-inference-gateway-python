@@ -1,0 +1,20 @@
+{
+  "quotas": [
+    {"caller": "demo", "max_concurrency": 4, "rate_per_second": 10.0},
+    {"caller": "batch", "max_concurrency": 1, "rate_per_second": 0.5}
+  ],
+  "default_quotas": {"max_concurrency": 8, "rate_per_second": null},
+  "cache_ttl_seconds": 30.0,
+  "coalesce_window_seconds": 0.0,
+  "downstream_timeout_seconds": 2.0,
+  "primary_backend": "primary",
+  "backends": {
+    "primary": {"kind": "echo", "delay": 0.0},
+    "echo":    {"kind": "echo"},
+    "null":    {"kind": "null"},
+    "flaky":   {"kind": "flaky", "behavior": "error"},
+    "slow":    {"kind": "flaky", "behavior": "slow", "delay": 5.0}
+  },
+  "fallback": {"mode": "fail", "fallback_backend": null,
+               "retry_on": ["downstream_timeout", "downstream_error", "downstream_bad_result"]}
+}
