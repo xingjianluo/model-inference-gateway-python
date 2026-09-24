@@ -1,0 +1,14 @@
+{
+  "fallback_mode": "fallback",
+  "default_max_concurrency": 4,
+  "default_rate_per_second": 10.0,
+  "quotas": {
+    "tenant-a": {"max_concurrency": 2, "rate_per_second": 5.0},
+    "tenant-b": {"max_concurrency": 1, "rate_per_second": 2.0}
+  },
+  "cache": {"ttl_seconds": 30.0, "coalesce_window": 0.05},
+  "timeout": {"downstream_timeout": 0.5, "fallback_timeout": 0.5},
+  "routes": {
+    "gpt-demo": {"primary": "primary-demo", "fallback": "backup-demo"}
+  }
+}
