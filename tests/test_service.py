@@ -317,3 +317,166 @@ async def test_quota_hot_reload_lowers_limit_without_restart(make_service):
     backend.release.set()
     await asyncio.gather(t1, t2)
     assert service.stats()["quota"]["c1"]["active"] == 0
+
+
+# ---------- 缓存按调用方隔离 ----------
+
+
+@pytest.mark.asyncio
+async def test_cache_is_isolated_per_caller(make_service):
+    cfg = make_config(
+        quotas={
+            "c1": QuotaRule("c1", max_concurrency=5, rate_per_second=None),
+            "c2": QuotaRule("c2", max_concurrency=5, rate_per_second=None),
+        },
+        default_rule=QuotaRule("__default__", 5, None),
+    )
+    service, _ = make_service(cfg, backends={"primary": EchoBackend("primary")})
+
+    r1 = await service.infer(req("a1", caller="c1"))
+    assert r1.cache_status == "miss"
+    # 相同输入、不同调用方：不能命中 c1 留下的缓存
+    r2 = await service.infer(req("b1", caller="c2"))
+    assert r2.cache_status == "miss"
+    # 各自再请求：各自命中自己的条目
+    assert (await service.infer(req("a2", caller="c1"))).cache_status == "hit"
+    assert (await service.infer(req("b2", caller="c2"))).cache_status == "hit"
+    assert service.stats()["cache"]["cached_entries"] == 2
+
+
+@pytest.mark.asyncio
+async def test_coalescing_is_isolated_per_caller(make_service):
+    backend = HoldBackend()
+    cfg = make_config(
+        quotas={
+            "c1": QuotaRule("c1", max_concurrency=5, rate_per_second=None),
+            "c2": QuotaRule("c2", max_concurrency=5, rate_per_second=None),
+        },
+        default_rule=QuotaRule("__default__", 5, None),
+    )
+    service, _ = make_service(cfg, backends={"primary": backend})
+
+    t1 = asyncio.create_task(service.infer(req("a1", caller="c1")))
+    await backend.started.wait()
+    t2 = asyncio.create_task(service.infer(req("b1", caller="c2")))
+    await asyncio.sleep(0.02)
+    # 不同调用方的相同输入不合并：下游被调用了两次
+    assert backend.calls == 2
+    backend.release.set()
+    r1, r2 = await asyncio.gather(t1, t2)
+    assert r1.cache_status == "miss" and r2.cache_status == "miss"
+
+
+# ---------- 结果来源（provenance） ----------
+
+
+@pytest.mark.asyncio
+async def test_response_exposes_source_path_and_generated_at(make_service):
+    cfg = make_config(
+        quotas={"c1": QuotaRule("c1", max_concurrency=5, rate_per_second=None)},
+        default_rule=QuotaRule("__default__", 5, None),
+    )
+    service, _ = make_service(cfg, backends={"primary": EchoBackend("primary")})
+
+    r1 = await service.infer(req("p1"))
+    assert r1.source == "fresh" and r1.path == "primary"
+    assert r1.generated_at > 0
+
+    r2 = await service.infer(req("p2"))
+    assert r2.source == "cache" and r2.path == "primary"
+    # 缓存结果保留原始产出时刻，而不是命中时刻
+    assert r2.generated_at == r1.generated_at
+
+
+@pytest.mark.asyncio
+async def test_coalesced_response_marks_shared_source(make_service):
+    backend = HoldBackend()
+    cfg = make_config(
+        quotas={"c1": QuotaRule("c1", max_concurrency=5, rate_per_second=None)},
+        default_rule=QuotaRule("__default__", 5, None),
+    )
+    service, _ = make_service(cfg, backends={"primary": backend})
+
+    leader = asyncio.create_task(service.infer(req("l1")))
+    await backend.started.wait()
+    waiter = asyncio.create_task(service.infer(req("w1")))
+    await asyncio.sleep(0.02)
+    backend.release.set()
+    r_leader, r_waiter = await asyncio.gather(leader, waiter)
+    assert r_leader.source == "fresh"
+    assert r_waiter.source == "coalesced"
+    assert r_waiter.generated_at == r_leader.generated_at
+
+
+# ---------- 降级结果的恢复语义 ----------
+
+
+@pytest.mark.asyncio
+async def test_degraded_result_not_cached_and_primary_recovers(make_service):
+    """走过备用路径的输入，在主路径恢复后必须重新反映主路径结果。"""
+    state = {"primary_down": True}
+
+    class Switchable:
+        name = "primary"
+
+        async def call(self, payload, *, request_id):
+            if state["primary_down"]:
+                raise RuntimeError("primary down (internal)")
+            return {"served_by": self.name, "healthy": True}
+
+    cfg = make_config(
+        quotas={"c1": QuotaRule("c1", max_concurrency=5, rate_per_second=None)},
+        default_rule=QuotaRule("__default__", 5, None),
+        fallback=FallbackPolicy(mode="fallback", fallback_backend="backup"),
+    )
+    service, _ = make_service(
+        cfg,
+        backends={"primary": Switchable(), "backup": EchoBackend("backup")},
+    )
+
+    # 主路径故障期：拿到降级结果（备用路径）
+    r1 = await service.infer(req("d1"))
+    assert r1.degraded is True and r1.path == "fallback" and r1.backend == "backup"
+
+    # 主路径恢复：同样的输入必须重新走主路径，而不是复用之前的降级结果
+    state["primary_down"] = False
+    r2 = await service.infer(req("d2"))
+    assert r2.cache_status == "miss"  # 降级结果从未入缓存
+    assert r2.degraded is False and r2.path == "primary"
+    assert r2.output["healthy"] is True
+
+    # 此后的正常结果才进入缓存
+    r3 = await service.infer(req("d3"))
+    assert r3.cache_status == "hit" and r3.degraded is False
+
+
+@pytest.mark.asyncio
+async def test_fallback_policy_flapping_keeps_results_self_consistent(make_service):
+    """降级策略反复切换：已受理请求按受理时快照执行，错误与结果始终可解释。"""
+    cfg = make_config(
+        quotas={"c1": QuotaRule("c1", max_concurrency=5, rate_per_second=None)},
+        default_rule=QuotaRule("__default__", 5, None),
+        fallback=FallbackPolicy(mode="fallback", fallback_backend="backup"),
+    )
+    service, store = make_service(
+        cfg,
+        backends={"primary": FlakyBackend("primary", behavior="error"),
+                  "backup": EchoBackend("backup")},
+    )
+
+    # fallback 模式：降级成功，且降级结果不入缓存
+    r1 = await service.infer(req("f1"))
+    assert r1.degraded is True and r1.path == "fallback"
+
+    # 切到 fail：同样的输入不会吃到“缓存的降级结果”，而是按新策略明确失败
+    await store.update_fallback(FallbackPolicy(mode="fail"))
+    with pytest.raises(DownstreamInvokeError) as ei:
+        await service.infer(req("f2"))
+    assert ei.value.code is ErrorCode.DOWNSTREAM_ERROR
+
+    # 再切回 fallback：新请求又按新快照降级成功
+    await store.update_fallback(
+        FallbackPolicy(mode="fallback", fallback_backend="backup")
+    )
+    r3 = await service.infer(req("f3"))
+    assert r3.degraded is True and r3.cache_status == "miss"

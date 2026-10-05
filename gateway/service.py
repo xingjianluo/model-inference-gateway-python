@@ -8,6 +8,13 @@
 - 合并等待者在挂起前释放自己的槽位（下游工作由 leader 的单槽承担），
   因此被取消/超时的等待者不会继续占用配额。
 - 只有下游成功结果写入缓存；超时、下游失败、降级路径上的任何异常都不写。
+- 缓存与合并按调用方隔离：缓存键包含 caller，任何调用方都不会命中或
+  合并到另一个调用方的条目。
+- 降级（备用路径）结果可兑现给当时的合并者，但不写入结果缓存：下游恢复后，
+  同样的输入会重新走主路径，不会一直拿旧的降级结果当正常结果。
+- consistency="strong" 的请求：绕过缓存与合并、禁用备用路径，必须拿到
+  主路径的新鲜结果；拿不到则以 consistency_unavailable 明确失败，
+  绝不拿旧缓存或降级结果顶替。两类请求互不污染。
 """
 
 from __future__ import annotations
@@ -30,12 +37,17 @@ from .downstream import (
 )
 from .errors import (
     ConcurrencyLimitedError,
+    ConsistencyUnavailableError,
     FallbackExhaustedError,
     GatewayError,
     InvalidRequestError,
     RateLimitedError,
 )
 from .quota import QuotaManager
+
+CONSISTENCY_DEFAULT = "default"
+CONSISTENCY_STRONG = "strong"
+_CONSISTENCY_LEVELS = (CONSISTENCY_DEFAULT, CONSISTENCY_STRONG)
 
 
 @dataclass(frozen=True)
@@ -44,6 +56,7 @@ class InferenceRequest:
     model: str
     inputs: dict[str, Any]
     request_id: str
+    consistency: str = CONSISTENCY_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -54,6 +67,10 @@ class InferenceResponse:
     backend: str
     degraded: bool
     quota: dict[str, Any]
+    consistency: str = CONSISTENCY_DEFAULT
+    source: str = "fresh"  # fresh | cache | coalesced
+    path: str = "primary"  # primary | fallback
+    generated_at: float = 0.0
 
 
 def _validate_request(request: InferenceRequest) -> None:
@@ -65,6 +82,11 @@ def _validate_request(request: InferenceRequest) -> None:
         raise InvalidRequestError("inputs must be a non-empty object")
     if not request.request_id or not isinstance(request.request_id, str):
         raise InvalidRequestError("missing request_id")
+    if request.consistency not in _CONSISTENCY_LEVELS:
+        raise InvalidRequestError(
+            "consistency must be one of: " + ", ".join(_CONSISTENCY_LEVELS),
+            detail={"consistency": request.consistency},
+        )
 
 
 class GatewayService:
@@ -84,6 +106,7 @@ class GatewayService:
         self._cache = CoalescingCache(
             ttl_seconds=config_store.snapshot().cache_ttl_seconds,
             coalesce_window_seconds=config_store.snapshot().coalesce_window_seconds,
+            max_entries=config_store.snapshot().cache_max_entries,
             clock=clock,
         )
         self._backends: dict[str, Backend] = dict(backends or {})
@@ -95,7 +118,9 @@ class GatewayService:
     def _on_config(self, old: GatewayConfig, new: GatewayConfig) -> None:
         # 同步监听器：先调限额（锁内串行，杜绝超卖），再调缓存参数。
         self._quota.apply_config(new)
-        self._cache.reconfigure(new.cache_ttl_seconds, new.coalesce_window_seconds)
+        self._cache.reconfigure(
+            new.cache_ttl_seconds, new.coalesce_window_seconds, new.cache_max_entries
+        )
         self._ensure_backends(new)
 
     def _ensure_backends(self, config: GatewayConfig) -> None:
@@ -109,8 +134,13 @@ class GatewayService:
     # ---------- 对外主流程 ----------
 
     def cache_key(self, request: InferenceRequest) -> str:
+        """缓存键按调用方隔离：同一 (model, inputs) 在不同 caller 下是不同条目。"""
         raw = json.dumps(
-            {"model": request.model, "inputs": request.inputs},
+            {
+                "caller": request.caller,
+                "model": request.model,
+                "inputs": request.inputs,
+            },
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -126,6 +156,7 @@ class GatewayService:
         self._logger.info(
             "quota decision",
             extra={"request_id": request.request_id, "event": "quota_decision",
+                   "consistency": request.consistency,
                    **decision.as_log_fields()},
         )
         if not decision.allowed:
@@ -136,6 +167,9 @@ class GatewayService:
         acquired = True
         cache_status = CacheStatus.MISS
         try:
+            if request.consistency == CONSISTENCY_STRONG:
+                return await self._infer_strong(request, config, decision)
+
             key = self.cache_key(request)
             outcome = self._cache.lookup(key)
             cache_status = outcome.status
@@ -145,7 +179,8 @@ class GatewayService:
                 self._logger.info(
                     "cache hit",
                     extra={"request_id": request.request_id, "event": "cache_hit",
-                           "cache_key": key, "backend": result.backend},
+                           "cache_key": key, "backend": result.backend,
+                           "consistency": request.consistency},
                 )
                 return self._response(request, result, CacheStatus.HIT, decision)
 
@@ -155,7 +190,7 @@ class GatewayService:
                 self._logger.info(
                     "coalesced onto in-flight request",
                     extra={"request_id": request.request_id, "event": "coalesced",
-                           "cache_key": key},
+                           "cache_key": key, "consistency": request.consistency},
                 )
                 result = await asyncio_shield(outcome.future)
                 return self._response(request, result, CacheStatus.COALESCED, decision)
@@ -168,17 +203,61 @@ class GatewayService:
                 # 传播给所有合并者、移除在途条目，避免等待者悬挂或占用配额。
                 self._cache.set_failure(key, outcome.future, exc)
                 raise
-            # 3) 只有成功才写缓存并兑现合并者
-            self._cache.set_result(key, outcome.future, result)
+            # 3) 只有成功才写缓存并兑现合并者；降级结果只兑现、不沉淀进缓存，
+            #    以便后端恢复后同样的输入重新反映主路径结果。
+            self._cache.set_result(
+                key, outcome.future, result, cacheable=not result.degraded
+            )
             self._logger.info(
                 "downstream success",
                 extra={"request_id": request.request_id, "event": "downstream_success",
-                       "cache_key": key, **self._result_log(result)},
+                       "cache_key": key, "consistency": request.consistency,
+                       **self._result_log(result)},
             )
             return self._response(request, result, CacheStatus.MISS, decision)
         finally:
             if acquired:
                 self._quota.release(request.caller)
+
+    async def _infer_strong(
+        self, request: InferenceRequest, config: GatewayConfig, decision
+    ) -> InferenceResponse:
+        """强一致请求：绕过缓存/合并与备用路径，只要主路径的新鲜结果。
+
+        不读缓存、不登记在途条目、不写缓存，因此与普通请求互不污染；
+        主路径此刻拿不到结果时，以 consistency_unavailable 明确失败。
+        """
+        self._logger.info(
+            "strong consistency: bypass cache and fallback",
+            extra={"request_id": request.request_id, "event": "consistency_bypass",
+                   "consistency": request.consistency,
+                   "caller": request.caller},
+        )
+        primary = self._backend_for(config.primary_backend, config)
+        payload = {"model": request.model, "inputs": request.inputs}
+        try:
+            result = await downstream_invoke(
+                primary,
+                payload,
+                request_id=request.request_id,
+                timeout=config.downstream_timeout_seconds,
+            )
+        except GatewayError as exc:
+            self._log_downstream_failure(request, config.primary_backend, exc)
+            raise ConsistencyUnavailableError(
+                detail={
+                    "consistency": CONSISTENCY_STRONG,
+                    "backend": config.primary_backend,
+                    "underlying_error": exc.code.value,
+                },
+            ) from exc
+        self._logger.info(
+            "downstream success",
+            extra={"request_id": request.request_id, "event": "downstream_success",
+                   "consistency": request.consistency,
+                   **self._result_log(result)},
+        )
+        return self._response(request, result, CacheStatus.BYPASSED, decision)
 
     def _release(self, caller: str, acquired: bool) -> bool:
         if acquired:
@@ -259,6 +338,14 @@ class GatewayService:
         status: CacheStatus,
         decision,
     ) -> InferenceResponse:
+        # 结果来源：fresh=本次新算（含强一致绕过）；cache=复用缓存；
+        # coalesced=复用在途请求的结果
+        source = {
+            CacheStatus.HIT: "cache",
+            CacheStatus.COALESCED: "coalesced",
+            CacheStatus.MISS: "fresh",
+            CacheStatus.BYPASSED: "fresh",
+        }[status]
         return InferenceResponse(
             request_id=request.request_id,
             output=result.output,
@@ -271,6 +358,10 @@ class GatewayService:
                 "rule_version": decision.rule_version,
                 "active_concurrency_at_admission": decision.active_concurrency,
             },
+            consistency=request.consistency,
+            source=source,
+            path="fallback" if result.degraded else "primary",
+            generated_at=result.generated_at,
         )
 
     @staticmethod
@@ -279,6 +370,7 @@ class GatewayService:
             "backend": result.backend,
             "degraded": result.degraded,
             "latency_ms": round(result.latency_ms, 2),
+            "generated_at": round(result.generated_at, 3),
         }
 
     def _log_downstream_failure(self, request: InferenceRequest, backend: str | None,

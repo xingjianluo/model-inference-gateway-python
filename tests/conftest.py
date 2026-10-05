@@ -38,6 +38,7 @@ class _JsonIntoMessage(logging.Filter):
         "event", "request_id", "caller", "allowed", "reason",
         "active_concurrency", "max_concurrency", "rate_per_second",
         "available_tokens", "rule_version", "cache_key", "cache_status",
+        "consistency", "source", "path", "generated_at",
         "backend", "primary", "error_code", "degraded", "latency_ms",
     )
 

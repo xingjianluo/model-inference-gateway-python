@@ -26,6 +26,8 @@ class DownstreamResult:
     output: dict[str, Any]
     degraded: bool = False
     latency_ms: float = 0.0
+    # 结果产出的墙钟时刻（epoch 秒）；缓存/合并复用时保留原产出时刻
+    generated_at: float = 0.0
 
 
 @runtime_checkable
@@ -140,7 +142,11 @@ async def invoke(
     output = _validate(backend.name, raw)
     latency_ms = (time.monotonic() - started) * 1000.0
     return DownstreamResult(
-        backend=backend.name, output=output, degraded=False, latency_ms=latency_ms
+        backend=backend.name,
+        output=output,
+        degraded=False,
+        latency_ms=latency_ms,
+        generated_at=time.time(),
     )
 
 

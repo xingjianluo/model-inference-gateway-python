@@ -125,3 +125,98 @@ async def test_stale_future_completion_is_ignored(fake_clock):
     assert not new.future.done()
     cache.set_result("k", new.future, {"v": "fresh"})
     assert cache.lookup("k").value == {"v": "fresh"}
+
+
+# ---------- 容量上限与 LRU 回收 ----------
+
+
+def _put(cache, key, value):
+    outcome = cache.lookup(key)
+    assert outcome.status is CacheStatus.MISS
+    cache.set_result(key, outcome.future, value)
+
+
+@pytest.mark.asyncio
+async def test_capacity_evicts_least_recently_used(fake_clock):
+    cache = CoalescingCache(ttl_seconds=10.0, max_entries=2, clock=fake_clock)
+    _put(cache, "k1", 1)
+    _put(cache, "k2", 2)
+    _put(cache, "k3", 3)  # 超出容量：最久未用的 k1 被回收
+
+    stats = cache.stats()
+    assert stats["cached_entries"] == 2
+    assert stats["evictions"] == 1
+    assert stats["max_entries"] == 2
+
+    assert cache.lookup("k1").status is CacheStatus.MISS  # 已被回收
+    assert cache.lookup("k2").status is CacheStatus.HIT
+    assert cache.lookup("k3").status is CacheStatus.HIT
+
+
+@pytest.mark.asyncio
+async def test_hit_refreshes_lru_order(fake_clock):
+    cache = CoalescingCache(ttl_seconds=10.0, max_entries=2, clock=fake_clock)
+    _put(cache, "k1", 1)
+    _put(cache, "k2", 2)
+    assert cache.lookup("k1").status is CacheStatus.HIT  # k1 变为最近使用
+
+    _put(cache, "k3", 3)  # 这次应回收 k2 而不是 k1
+    assert cache.lookup("k2").status is CacheStatus.MISS
+    o = cache.lookup("k1")
+    assert o.status is CacheStatus.HIT and o.value == 1
+
+
+@pytest.mark.asyncio
+async def test_eviction_never_touches_in_flight_entries(fake_clock):
+    """容量回收只影响结果缓存；进行中的合并不被打乱，结果仍正确兑现。"""
+    cache = CoalescingCache(ttl_seconds=10.0, max_entries=1, clock=fake_clock)
+
+    inflight = cache.lookup("x")  # x 在途，尚未完成
+    assert inflight.status is CacheStatus.MISS
+
+    _put(cache, "a", "A")
+    _put(cache, "b", "B")  # 触发回收：只能回收已完成的结果缓存条目
+    assert cache.stats()["evictions"] == 1
+
+    # x 的在途合并毫发无损：后来者仍合并到同一个 future
+    again = cache.lookup("x")
+    assert again.status is CacheStatus.COALESCED and again.future is inflight.future
+
+    cache.set_result("x", inflight.future, "X")  # 正常兑现并写入缓存
+    assert inflight.future.result() == "X"
+    hit = cache.lookup("x")
+    assert hit.status is CacheStatus.HIT and hit.value == "X"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_shrinks_capacity_and_evicts_immediately(fake_clock):
+    cache = CoalescingCache(ttl_seconds=10.0, max_entries=5, clock=fake_clock)
+    for i in range(4):
+        _put(cache, f"k{i}", i)
+    assert cache.stats()["cached_entries"] == 4
+
+    cache.reconfigure(ttl_seconds=10.0, coalesce_window_seconds=0.0, max_entries=2)
+    stats = cache.stats()
+    assert stats["cached_entries"] == 2
+    assert stats["evictions"] == 2
+    # 留下的是最近写入的 k2/k3
+    assert cache.lookup("k3").status is CacheStatus.HIT
+    assert cache.lookup("k2").status is CacheStatus.HIT
+    assert cache.lookup("k0").status is CacheStatus.MISS
+
+
+@pytest.mark.asyncio
+async def test_non_cacheable_result_fulfills_waiters_but_is_not_stored(fake_clock):
+    """cacheable=False（如降级结果）：合并者照常拿到结果，但不沉淀进缓存。"""
+    cache = CoalescingCache(ttl_seconds=10.0, clock=fake_clock)
+    o1 = cache.lookup("k")
+    o2 = cache.lookup("k")
+    assert o2.status is CacheStatus.COALESCED
+
+    cache.set_result("k", o1.future, {"degraded": True}, cacheable=False)
+    assert o1.future.result() == {"degraded": True}
+    assert await asyncio.shield(o2.future) == {"degraded": True}
+
+    # 未写入结果缓存：下一个请求是全新 MISS
+    assert cache.stats()["cached_entries"] == 0
+    assert cache.lookup("k").status is CacheStatus.MISS
