@@ -16,6 +16,7 @@ class ErrorCode(str, Enum):
     DOWNSTREAM_ERROR = "downstream_error"
     DOWNSTREAM_BAD_RESULT = "downstream_bad_result"
     FALLBACK_EXHAUSTED = "fallback_exhausted"
+    CONSISTENCY_UNAVAILABLE = "consistency_unavailable"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -28,6 +29,7 @@ HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.DOWNSTREAM_ERROR: 502,
     ErrorCode.DOWNSTREAM_BAD_RESULT: 502,
     ErrorCode.FALLBACK_EXHAUSTED: 502,
+    ErrorCode.CONSISTENCY_UNAVAILABLE: 503,
     ErrorCode.INTERNAL_ERROR: 500,
 }
 
@@ -91,3 +93,10 @@ class DownstreamBadResultError(GatewayError):
 class FallbackExhaustedError(GatewayError):
     def __init__(self, message: str = "all downstream paths failed", *, detail: Any = None) -> None:
         super().__init__(ErrorCode.FALLBACK_EXHAUSTED, message, detail=detail)
+
+
+class ConsistencyUnavailableError(GatewayError):
+    """强一致请求在此刻拿不到主路径新鲜结果：明确失败，绝不以旧值/降级顶替。"""
+
+    def __init__(self, message: str = "strong consistency unavailable", *, detail: Any = None) -> None:
+        super().__init__(ErrorCode.CONSISTENCY_UNAVAILABLE, message, detail=detail)

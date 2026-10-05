@@ -37,6 +37,10 @@ _EXTRA_FIELDS = (
     "error_code",
     "degraded",
     "latency_ms",
+    "consistency",
+    "source",
+    "freshness",
+    "produced_at",
 )
 
 

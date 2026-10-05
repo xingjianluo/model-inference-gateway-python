@@ -125,3 +125,92 @@ async def test_stale_future_completion_is_ignored(fake_clock):
     assert not new.future.done()
     cache.set_result("k", new.future, {"v": "fresh"})
     assert cache.lookup("k").value == {"v": "fresh"}
+
+
+@pytest.mark.asyncio
+async def test_lru_evicts_least_recently_used_when_over_capacity(fake_clock):
+    cache = CoalescingCache(ttl_seconds=100.0, max_entries=2, clock=fake_clock)
+
+    for key in ("a", "b"):
+        o = cache.lookup(key)
+        cache.set_result(key, o.future, {"k": key})
+    assert cache.stats()["cached_entries"] == 2
+
+    # 写入第三个：最久未用的 a 被淘汰
+    o = cache.lookup("c")
+    cache.set_result("c", o.future, {"k": "c"})
+    stats = cache.stats()
+    assert stats["cached_entries"] == 2
+    assert stats["evictions"] == 1
+    assert cache.lookup("a").status is CacheStatus.MISS  # a 已被回收
+    assert cache.lookup("b").status is CacheStatus.HIT
+    assert cache.lookup("c").status is CacheStatus.HIT
+
+
+@pytest.mark.asyncio
+async def test_hit_refreshes_lru_order(fake_clock):
+    cache = CoalescingCache(ttl_seconds=100.0, max_entries=2, clock=fake_clock)
+    for key in ("a", "b"):
+        o = cache.lookup(key)
+        cache.set_result(key, o.future, {"k": key})
+
+    # 命中 a 使其变热；再写入 c 时淘汰的是 b
+    assert cache.lookup("a").status is CacheStatus.HIT
+    o = cache.lookup("c")
+    cache.set_result("c", o.future, {"k": "c"})
+
+    assert cache.lookup("a").status is CacheStatus.HIT
+    assert cache.lookup("b").status is CacheStatus.MISS
+    assert cache.stats()["evictions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_eviction_never_touches_in_flight_entries(fake_clock):
+    """容量回收只影响结果缓存：在途合并不被打乱，等待者仍拿到正确结果。"""
+    cache = CoalescingCache(ttl_seconds=100.0, max_entries=1, clock=fake_clock)
+
+    # 一个在途 leader + 一个合并等待者
+    o1 = cache.lookup("inflight")
+    o2 = cache.lookup("inflight")
+    assert o2.status is CacheStatus.COALESCED
+
+    # 结果缓存被写满并触发淘汰（与在途条目无关）
+    for key in ("x", "y"):
+        o = cache.lookup(key)
+        cache.set_result(key, o.future, {"k": key})
+    assert cache.stats()["evictions"] == 1
+    assert cache.stats()["inflight_keys"] == 1  # 在途条目完好
+
+    # 在途 leader 正常兑现，等待者拿到一致结果
+    cache.set_result("inflight", o1.future, {"v": "ok"})
+    assert await o2.future == {"v": "ok"}
+    # 但容量为 1 且被 y 占据：inflight 的结果写入会淘汰 y，语义仍自洽
+    assert cache.lookup("inflight").status is CacheStatus.HIT
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_shrinks_capacity_and_evicts_immediately(fake_clock):
+    cache = CoalescingCache(ttl_seconds=100.0, max_entries=5, clock=fake_clock)
+    for key in ("a", "b", "c"):
+        o = cache.lookup(key)
+        cache.set_result(key, o.future, {"k": key})
+    assert cache.stats()["cached_entries"] == 3
+
+    cache.reconfigure(100.0, 0.0, 1)  # 热更新：容量缩到 1
+    stats = cache.stats()
+    assert stats["cached_entries"] == 1
+    assert stats["evictions"] == 2
+    assert cache.lookup("c").status is CacheStatus.HIT  # 最近的保留
+    assert cache.lookup("a").status is CacheStatus.MISS
+
+
+@pytest.mark.asyncio
+async def test_unlimited_capacity_by_default(fake_clock):
+    cache = CoalescingCache(ttl_seconds=100.0, clock=fake_clock)
+    for i in range(10):
+        o = cache.lookup(f"k{i}")
+        cache.set_result(f"k{i}", o.future, {"i": i})
+    stats = cache.stats()
+    assert stats["cached_entries"] == 10
+    assert stats["evictions"] == 0
+    assert stats["max_entries"] is None

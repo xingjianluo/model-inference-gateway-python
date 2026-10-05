@@ -45,6 +45,7 @@ class GatewayConfig:
     quotas: Mapping[str, QuotaRule] = field(default_factory=dict)
     default_rule: QuotaRule = QuotaRule(caller="__default__")
     cache_ttl_seconds: float = 30.0
+    cache_max_entries: int | None = None  # 结果缓存条目上限；None 表示不限制
     coalesce_window_seconds: float = 0.0
     downstream_timeout_seconds: float = 10.0
     primary_backend: str = "echo"
@@ -129,6 +130,10 @@ def config_from_dict(data: Mapping[str, object]) -> GatewayConfig:
         quotas=quotas,
         default_rule=default_rule,
         cache_ttl_seconds=float(data.get("cache_ttl_seconds", 30.0)),
+        cache_max_entries=(
+            None if data.get("cache_max_entries") is None
+            else int(data.get("cache_max_entries"))
+        ),
         coalesce_window_seconds=float(data.get("coalesce_window_seconds", 0.0)),
         downstream_timeout_seconds=float(data.get("downstream_timeout_seconds", 10.0)),
         primary_backend=str(data.get("primary_backend", "echo")),

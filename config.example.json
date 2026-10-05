@@ -5,6 +5,7 @@
   ],
   "default_quotas": {"max_concurrency": 8, "rate_per_second": null},
   "cache_ttl_seconds": 30.0,
+  "cache_max_entries": 1000,
   "coalesce_window_seconds": 0.0,
   "downstream_timeout_seconds": 2.0,
   "primary_backend": "primary",

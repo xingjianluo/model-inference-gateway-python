@@ -7,7 +7,14 @@
   且只归还一次；被拒请求从不计数。
 - 合并等待者在挂起前释放自己的槽位（下游工作由 leader 的单槽承担），
   因此被取消/超时的等待者不会继续占用配额。
-- 只有下游成功结果写入缓存；超时、下游失败、降级路径上的任何异常都不写。
+- 缓存按调用方隔离（caller 命名空间）；整体容量受 cache_max_entries 约束，
+  按 LRU 回收且只影响结果缓存，不触碰在途合并。
+- 一致性等级：consistency="strong" 的请求不读缓存、不走备用路径、与普通
+  请求的在途合并隔离；主路径此刻拿不到新鲜结果即以 consistency_unavailable
+  明确失败。普通请求的合并与缓存行为不变，两类请求互不污染。
+- 只有主路径成功结果写入缓存；超时、下游失败、降级路径上的任何异常都不写；
+  降级（备用路径）结果只兑现本次合并者、不留缓存，下游恢复后同一输入重新
+  反映主路径结果。
 """
 
 from __future__ import annotations
@@ -26,10 +33,13 @@ from .downstream import (
     Backend,
     DownstreamResult,
     build_backend,
+)
+from .downstream import (
     invoke as downstream_invoke,
 )
 from .errors import (
     ConcurrencyLimitedError,
+    ConsistencyUnavailableError,
     FallbackExhaustedError,
     GatewayError,
     InvalidRequestError,
@@ -44,6 +54,10 @@ class InferenceRequest:
     model: str
     inputs: dict[str, Any]
     request_id: str
+    # 一致性等级：
+    #   "cached"  默认；允许命中缓存/合并/降级路径
+    #   "strong"  必须实时打主路径：不读缓存、不走备用路径，拿不到即明确失败
+    consistency: str = "cached"
 
 
 @dataclass(frozen=True)
@@ -54,6 +68,10 @@ class InferenceResponse:
     backend: str
     degraded: bool
     quota: dict[str, Any]
+    # 结果来源与新鲜度（可观测、可解释）
+    source: str = "primary"      # primary | fallback
+    freshness: str = "fresh"     # fresh（本次新算） | reused（复用在途/缓存结果）
+    produced_at: float = 0.0     # 结果产出的墙钟时间戳
 
 
 def _validate_request(request: InferenceRequest) -> None:
@@ -65,6 +83,11 @@ def _validate_request(request: InferenceRequest) -> None:
         raise InvalidRequestError("inputs must be a non-empty object")
     if not request.request_id or not isinstance(request.request_id, str):
         raise InvalidRequestError("missing request_id")
+    if request.consistency not in ("cached", "strong"):
+        raise InvalidRequestError(
+            "consistency must be 'cached' or 'strong'",
+            detail={"consistency": request.consistency},
+        )
 
 
 class GatewayService:
@@ -84,6 +107,7 @@ class GatewayService:
         self._cache = CoalescingCache(
             ttl_seconds=config_store.snapshot().cache_ttl_seconds,
             coalesce_window_seconds=config_store.snapshot().coalesce_window_seconds,
+            max_entries=config_store.snapshot().cache_max_entries,
             clock=clock,
         )
         self._backends: dict[str, Backend] = dict(backends or {})
@@ -95,7 +119,9 @@ class GatewayService:
     def _on_config(self, old: GatewayConfig, new: GatewayConfig) -> None:
         # 同步监听器：先调限额（锁内串行，杜绝超卖），再调缓存参数。
         self._quota.apply_config(new)
-        self._cache.reconfigure(new.cache_ttl_seconds, new.coalesce_window_seconds)
+        self._cache.reconfigure(
+            new.cache_ttl_seconds, new.coalesce_window_seconds, new.cache_max_entries
+        )
         self._ensure_backends(new)
 
     def _ensure_backends(self, config: GatewayConfig) -> None:
@@ -119,6 +145,7 @@ class GatewayService:
 
     async def infer(self, request: InferenceRequest) -> InferenceResponse:
         _validate_request(request)
+        strong = request.consistency == "strong"
 
         # 1) 准入点：此后该请求看到的配置是这份不可变快照
         config = self._store.snapshot()
@@ -126,6 +153,7 @@ class GatewayService:
         self._logger.info(
             "quota decision",
             extra={"request_id": request.request_id, "event": "quota_decision",
+                   "consistency": request.consistency,
                    **decision.as_log_fields()},
         )
         if not decision.allowed:
@@ -134,11 +162,15 @@ class GatewayService:
             raise ConcurrencyLimitedError(detail={"caller": request.caller})
 
         acquired = True
-        cache_status = CacheStatus.MISS
         try:
-            key = self.cache_key(request)
-            outcome = self._cache.lookup(key)
-            cache_status = outcome.status
+            # 缓存按调用方隔离：不同 caller 的相同输入互不命中、互不合并
+            key = f"{request.caller}:{self.cache_key(request)}"
+            outcome = self._cache.lookup(
+                key,
+                use_cache=not strong,          # 强一致：绝不读历史缓存
+                lane="strong:" if strong else "",  # 强/普通在途合并隔离，互不污染
+            )
+            ikey = outcome.inflight_key
 
             if outcome.status is CacheStatus.HIT:
                 result: DownstreamResult = outcome.value
@@ -155,21 +187,26 @@ class GatewayService:
                 self._logger.info(
                     "coalesced onto in-flight request",
                     extra={"request_id": request.request_id, "event": "coalesced",
-                           "cache_key": key},
+                           "cache_key": key, "consistency": request.consistency},
                 )
                 result = await asyncio_shield(outcome.future)
                 return self._response(request, result, CacheStatus.COALESCED, decision)
 
-            # 2) leader：调用下游（含降级策略，使用准入时快照）
+            # 2) leader：调用下游（强一致走主路径且禁止降级；使用准入时快照）
             try:
-                result = await self._invoke_with_fallback(config, request)
+                result = await self._invoke_with_fallback(
+                    config, request, allow_fallback=not strong
+                )
             except BaseException as exc:
                 # 任何失败（含下游超时/调用方取消）都不写结果缓存，并把异常
                 # 传播给所有合并者、移除在途条目，避免等待者悬挂或占用配额。
-                self._cache.set_failure(key, outcome.future, exc)
+                self._cache.set_failure(key, outcome.future, exc, inflight_key=ikey)
                 raise
-            # 3) 只有成功才写缓存并兑现合并者
-            self._cache.set_result(key, outcome.future, result)
+            # 3) 成功才兑现合并者；降级结果不写结果缓存（见 set_result cache_result）
+            self._cache.set_result(
+                key, outcome.future, result,
+                inflight_key=ikey, cache_result=not result.degraded,
+            )
             self._logger.info(
                 "downstream success",
                 extra={"request_id": request.request_id, "event": "downstream_success",
@@ -188,7 +225,11 @@ class GatewayService:
     # ---------- 下游调用与降级 ----------
 
     async def _invoke_with_fallback(
-        self, config: GatewayConfig, request: InferenceRequest
+        self,
+        config: GatewayConfig,
+        request: InferenceRequest,
+        *,
+        allow_fallback: bool = True,
     ) -> DownstreamResult:
         payload = {"model": request.model, "inputs": request.inputs}
         timeout = config.downstream_timeout_seconds
@@ -200,6 +241,22 @@ class GatewayService:
             )
         except GatewayError as primary_err:
             self._log_downstream_failure(request, config.primary_backend, primary_err)
+            if not allow_fallback:
+                # 强一致请求：不允许备用路径顶替，按可区分错误明确失败
+                self._logger.info(
+                    "strong consistency unavailable",
+                    extra={"request_id": request.request_id,
+                           "event": "consistency_unavailable",
+                           "backend": config.primary_backend,
+                           "error_code": primary_err.code.value},
+                )
+                raise ConsistencyUnavailableError(
+                    "strong consistency required but primary path failed",
+                    detail={
+                        "backend": config.primary_backend,
+                        "reason": primary_err.code.value,
+                    },
+                ) from primary_err
 
             policy = config.fallback
             can_fallback = (
@@ -259,7 +316,7 @@ class GatewayService:
         status: CacheStatus,
         decision,
     ) -> InferenceResponse:
-        return InferenceResponse(
+        response = InferenceResponse(
             request_id=request.request_id,
             output=result.output,
             cache_status=status.value,
@@ -271,7 +328,26 @@ class GatewayService:
                 "rule_version": decision.rule_version,
                 "active_concurrency_at_admission": decision.active_concurrency,
             },
+            source="fallback" if result.degraded else "primary",
+            freshness="fresh" if status is CacheStatus.MISS else "reused",
+            produced_at=result.produced_at,
         )
+        # 每个成功响应一条来源日志：请求标识 + 判定依据 + 结果从哪儿来
+        self._logger.info(
+            "response",
+            extra={
+                "request_id": request.request_id,
+                "event": "response",
+                "consistency": request.consistency,
+                "cache_status": response.cache_status,
+                "source": response.source,
+                "freshness": response.freshness,
+                "backend": response.backend,
+                "degraded": response.degraded,
+                "produced_at": response.produced_at,
+            },
+        )
+        return response
 
     @staticmethod
     def _result_log(result: DownstreamResult) -> dict:

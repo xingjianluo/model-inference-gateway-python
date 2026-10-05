@@ -39,6 +39,7 @@ class _JsonIntoMessage(logging.Filter):
         "active_concurrency", "max_concurrency", "rate_per_second",
         "available_tokens", "rule_version", "cache_key", "cache_status",
         "backend", "primary", "error_code", "degraded", "latency_ms",
+        "consistency", "source", "freshness", "produced_at",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:

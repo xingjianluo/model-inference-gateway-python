@@ -56,6 +56,7 @@ class InferBody(BaseModel):
     model: str = Field(min_length=1)
     inputs: dict[str, Any]
     request_id: str | None = None
+    consistency: str = "cached"  # cached | strong
 
 
 def load_config() -> GatewayConfig:
@@ -106,6 +107,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             model=body.model,
             inputs=body.inputs,
             request_id=body.request_id or f"req-{uuid.uuid4().hex[:12]}",
+            consistency=body.consistency,
         )
         response = await service.infer(request)
         return {
@@ -114,6 +116,9 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             "cache_status": response.cache_status,
             "backend": response.backend,
             "degraded": response.degraded,
+            "source": response.source,
+            "freshness": response.freshness,
+            "produced_at": response.produced_at,
             "quota": response.quota,
         }
 
@@ -122,6 +127,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         cfg = store.snapshot()
         return {
             "cache_ttl_seconds": cfg.cache_ttl_seconds,
+            "cache_max_entries": cfg.cache_max_entries,
             "coalesce_window_seconds": cfg.coalesce_window_seconds,
             "downstream_timeout_seconds": cfg.downstream_timeout_seconds,
             "primary_backend": cfg.primary_backend,

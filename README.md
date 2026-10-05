@@ -1,6 +1,7 @@
 # Model Inference Gateway（本地推理网关）
 
 在推理调用方与下游模型后端之间，统一处理 **准入配额、相同输入合并/缓存、下游失败降级与错误归一化**，
+并为对正确性敏感的调用方提供 **按次一致性等级、可治理缓存（调用方隔离 + 容量回收）、结果来源与恢复语义**，
 使“高并发、下游异常、配置在线变更”三种情况下的对外行为稳定、可预期、可观测。
 
 零外部依赖、零真实凭据：内置确定性桩后端（`echo` / `null` / `flaky`），本地即可复现全部行为与测试。
@@ -27,7 +28,7 @@ curl -s -X POST localhost:8000/v1/infer \
 运行测试（会通过 pytest live log 打印**请求标识、配额判定依据、下游调用结果**）：
 
 ```bash
-uv run pytest                       # 全部 34 个用例
+uv run pytest                       # 全部 55 个用例
 uv run pytest -k quota -s           # 只看配额相关
 uv run pytest tests/test_service.py # 端到端语义
 ```
@@ -38,7 +39,7 @@ uv run pytest tests/test_service.py # 端到端语义
 
 | 方法 & 路径 | 说明 |
 | --- | --- |
-| `POST /v1/infer` | 推理入口。请求体：`caller`、`model`、`inputs`（非空对象）、可选 `request_id`（缺省自动生成） |
+| `POST /v1/infer` | 推理入口。请求体：`caller`、`model`、`inputs`（非空对象）、可选 `request_id`（缺省自动生成）、可选 `consistency`（`cached` 默认 / `strong`） |
 | `GET  /health` | 健康检查 |
 | `GET  /admin/config` | 查看当前生效配置（配额 / 缓存 / 超时 / 降级） |
 | `PUT  /admin/config/quotas` | 热更新全部调用方配额，**不重启进程** |
@@ -55,6 +56,9 @@ uv run pytest tests/test_service.py # 端到端语义
   "cache_status": "miss",          // miss | hit | coalesced
   "backend": "primary",
   "degraded": false,
+  "source": "primary",             // primary | fallback：走的是主路径还是备用路径
+  "freshness": "fresh",            // fresh（本次新算） | reused（复用在途/缓存结果）
+  "produced_at": 1791167699.96,    // 结果产出的墙钟时间戳（缓存复用时为原始产出时刻）
   "quota": {"caller": "demo", "reason": "ok", "rule_version": 0,
             "active_concurrency_at_admission": 1}
 }
@@ -78,6 +82,7 @@ uv run pytest tests/test_service.py # 端到端语义
 | `downstream_error` | 502 | 下游抛异常（内部类型/消息不外泄） |
 | `downstream_bad_result` | 502 | 下游返回 `null` / 非对象 / 空对象 |
 | `fallback_exhausted` | 502 | 主、备路径都失败（detail 给出两段错误码） |
+| `consistency_unavailable` | 503 | `consistency=strong` 请求此刻拿不到主路径新鲜结果（detail 给出主路径错误码）；绝不以缓存旧值或备用路径顶替 |
 | `internal_error` | 500 | 兜底未知错误（响应体不含细节，细节仅进服务端日志） |
 
 ---
@@ -121,7 +126,9 @@ curl -s -X PUT localhost:8000/admin/config/quotas \
 
 ## 4. 合并与结果缓存规则
 
-缓存键：`sha256(规范化 JSON(model, inputs))`（与 `caller`、`request_id` 无关；相同模型+输入即同键）。
+缓存键：`caller + ":" + sha256(规范化 JSON(model, inputs))`。**缓存按调用方隔离**：相同模型+输入，
+不同 `caller` 互不命中、互不合并，一个调用方永远拿不到另一个调用方留下的结果
+（`test_cache_is_isolated_per_caller`）。
 
 每次请求三级判定，结果通过响应中的 `cache_status` 与服务端日志可观测：
 
@@ -132,18 +139,72 @@ curl -s -X PUT localhost:8000/admin/config/quotas \
 
 规则与保证：
 
-- `cache_ttl_seconds`：成功结果的 TTL；到期惰性失效。**只有下游成功结果写缓存**。
+- `cache_ttl_seconds`：成功结果的 TTL；到期惰性失效。**只有主路径成功结果写缓存**。
 - 下游**超时、抛错、返回非法结果时绝不写缓存**（`test_failure_is_never_cached`、
   `test_failure_does_not_poison_cache`、`test_timeout_releases_quota_and_caches_nothing`）。
+- **降级（备用路径）结果不写入结果缓存**：本次合并者仍拿到一致的降级结果，但不留下缓存条目，
+  下游恢复后同一输入会重新走主路径（见第 6 节）。
+- `cache_max_entries`（默认 `null` 不限）：结果缓存条目上限。超过上限时按**最久未用（LRU）**
+  顺序回收；命中会刷新条目热度。回收只删除结果缓存条目、**绝不触碰在途合并**
+  （`test_eviction_never_touches_in_flight_entries`），只影响后续请求是否命中，不会返回错误结果。
+  容量可在线热更新，缩容立即生效。
 - 合并等待者用 `asyncio.shield` 挂接：**等待者被取消不会取消 leader**，leader 仍可完成并回填缓存。
 - leader 自己被取消时：leader 收到取消、槽位回收、在途条目清除；传播给其他等待者的是归一化的
   `downstream_error`（内部取消语义不外泄），等待者不会悬挂。
 - `coalesce_window_seconds`（默认 `0` 关闭）：> 0 时，leader 失败后失败条目会在短窗口内继续合并
   瞬时重试，避免失败风暴反复冲击下游；这不是结果缓存，窗口过后自动允许新 leader。
 
+缓存运营指标（`GET /admin/stats` 的 `cache` 段）：`hits / misses / coalesced / evictions /
+cached_entries / max_entries / inflight_keys / ttl_seconds`。
+
 ---
 
-## 5. 降级策略与错误归一化
+## 5. 按次一致性等级（`consistency`）
+
+每个请求可独立声明一致性要求，两类请求混发互不污染：
+
+| 等级 | 语义 |
+| --- | --- |
+| `cached`（默认） | 允许命中缓存、合并到在途请求、主路径失败时按策略走备用路径 |
+| `strong` | **必须实时从主路径拿新鲜结果**：不读历史缓存、不走备用路径；此刻拿不到即以 `consistency_unavailable`（503）明确失败，绝不糊弄成成功 |
+
+`strong` 的具体保证：
+
+- **不读缓存**：即使存在未过期的缓存条目也绕过，重新调用主路径下游。
+- **不用备用路径顶替**：主路径失败时不进入降级逻辑，直接返回可区分的
+  `consistency_unavailable`，detail 中带主路径的错误码（如 `downstream_timeout`）。
+- **与普通请求隔离**：强一致与普通请求的在途合并走不同通道，同时打进来的两类请求
+  互不合并、互不污染（普通在途可能走降级，强一致绝不搭它的车；
+  `test_strong_and_normal_in_flight_do_not_pollute_each_other`）。
+- **强一致之间仍可合并**：同调用方同输入的多个 `strong` 请求共享一次主路径调用。
+- **成功结果回填缓存**：`strong` 拿到的主路径新鲜结果会刷新缓存，后续普通请求命中的是这份新结果。
+- 判定依据可从响应（`cache_status/source/freshness`）与日志（每条日志带 `consistency` 字段，
+  失败时有 `consistency_unavailable` 事件）中看出。
+
+非法取值（如 `eventual`）按 `invalid_request`（400）拒绝。
+
+---
+
+## 6. 结果来源与恢复语义
+
+每个成功响应都带来源信息，调用方可据此判断结果可信度：
+
+- `source`：`primary`（主路径）/ `fallback`（备用路径，此时 `degraded=true`）。
+- `freshness`：`fresh`（本次新算，`cache_status=miss`）/ `reused`（复用在途合并或缓存结果）。
+- `produced_at`：结果产出的墙钟时间戳；缓存/合并复用时保留原始产出时刻，可据此判断结果年龄。
+
+恢复语义：
+
+- 某输入因下游异常走过备用路径后，**降级结果不会被缓存**。下游恢复后，同一输入再次进来
+  必然重新调用主路径并反映主路径结果（`test_degraded_result_is_not_cached_and_recovers_to_primary`），
+  不会一直拿之前的降级结果当正常结果返回。
+- 降级策略被反复热切换时，**已受理请求按准入时的策略快照执行到底**，其结果与错误自洽、可解释；
+  新请求立即使用最新策略（`test_fallback_policy_flip_flop_keeps_in_flight_request_self_consistent`、
+  `test_fallback_switch_during_in_flight_uses_admission_snapshot`）。
+
+---
+
+## 7. 降级策略与错误归一化
 
 配置：
 
@@ -176,40 +237,47 @@ curl -s -X PUT localhost:8000/admin/config/quotas \
 
 ---
 
-## 6. 可观测性（日志）
+## 8. 可观测性（日志）
 
 - 生产：每条业务日志输出为单行 JSON（stderr），含 `request_id`、`event` 等结构化字段。
-  - 配额事件 `quota_decision`：`allowed/reason/active_concurrency/max_concurrency/rate_per_second/available_tokens/rule_version`；
-  - 缓存事件：`cache_hit / coalesced`，含 `cache_key/cache_status`；
-  - 下游事件：`downstream_success`（`backend/degraded/latency_ms`）、`downstream_failure`（`backend/error_code`）、`fallback_success`。
+  - 配额事件 `quota_decision`：`allowed/reason/active_concurrency/max_concurrency/rate_per_second/available_tokens/rule_version/consistency`；
+  - 缓存事件：`cache_hit / coalesced`，含 `cache_key/cache_status/consistency`；
+  - 下游事件：`downstream_success`（`backend/degraded/latency_ms`）、`downstream_failure`（`backend/error_code`）、`fallback_success`；
+  - 一致性事件：`consistency_unavailable`（`backend/error_code`，强一致主路径失败时）；
+  - 响应事件 `response`：每个成功响应一条，含 `consistency/cache_status/source/freshness/backend/degraded/produced_at`——
+    请求标识、判定依据与结果来源一一对应。
 - 测试：`pytest` live log 直接打印同样信息，例如：
-  `quota decision | event=quota_decision request_id=r1 caller=c1 allowed=True reason=ok ... rule_version=0`
+  `response | event=response request_id=r1 cache_status=miss consistency=strong source=primary freshness=fresh ...`
 
-计数观测：`GET /admin/stats` 返回缓存 `hits/misses/coalesced` 与各调用方在途并发。
+计数观测：`GET /admin/stats` 返回缓存 `hits/misses/coalesced/evictions/cached_entries/max_entries`
+与各调用方在途并发。
 
 ---
 
-## 7. 代码结构
+## 9. 代码结构
 
 ```
 gateway/
   errors.py          错误码、对外错误类型与 HTTP 映射（归一化出口）
   config.py          配置模型、原子热更新存储 ConfigStore、JSON 解析
   quota.py           并发槽 + 令牌桶 QuotaManager（锁内无让出点）
-  cache.py           单飞合并 + TTL 缓存 CoalescingCache（hit/coalesced/miss）
+  cache.py           单飞合并 + TTL 缓存 + LRU 容量回收 CoalescingCache
   downstream.py      Backend 协议、invoke 超时/归一化包装、echo/null/flaky 桩后端
-  service.py         编排：校验→准入→合并/缓存→下游→降级→归一化响应
+  service.py         编排：校验→准入→合并/缓存→下游→降级→归一化响应（一致性等级判定）
   logging_setup.py   JSON 结构化日志
 main.py             FastAPI 入口、/v1/infer、/admin/* 配置与统计端点
-tests/              quota / cache / service / app 四组共 34 个本地可复现用例
+tests/              quota / cache / consistency / recovery / service / app 六组共 55 个本地可复现用例
 ```
 
-## 8. 本地验证清单
+## 10. 本地验证清单
 
 ```bash
-uv run pytest                 # 并发配额、缓存一致性、超时取消、降级路径全覆盖
-curl ... /v1/infer            # miss 再请求一次变 hit
+uv run pytest                 # 配额、缓存一致性/隔离/容量、强一致、超时取消、降级与恢复全覆盖
+uv run pytest -k consistency  # 只看按次一致性等级
+uv run pytest -k recovery     # 只看隔离与恢复语义
+curl ... /v1/infer            # miss 再请求一次变 hit；响应含 source/freshness/produced_at
+curl ... /v1/infer -d '... "consistency":"strong"'   # 绕过缓存打主路径；主路径挂掉时得 503 consistency_unavailable
 PUT /admin/config/quotas      # 在线降/升配额，立即观察 429 与恢复
-PUT /admin/config/fallback    # fail / fallback 切换，观察错误码与 degraded
-GET /admin/stats              # 核对 hits/coalesced 与在途并发计数
+PUT /admin/config/fallback    # fail / fallback 切换，观察错误码与 degraded；降级结果不缓存，恢复后回主路径
+GET /admin/stats              # 核对 hits/coalesced/evictions/cached_entries 与在途并发计数
 ```
